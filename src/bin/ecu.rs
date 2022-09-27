@@ -59,6 +59,7 @@ mod app {
         let dac_pin = gpioa.pa4.into_analog();
         let dac = cx.device.DAC;
         let dac = hal::dac::dac(dac, dac_pin);
+        dac.enable();
 
         (
             Shared {},
