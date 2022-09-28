@@ -62,8 +62,9 @@ mod app {
         let gpiob = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOB);
 
         let mut can = {
-            let rx = gpioa.pa11.into_alternate();
-            let tx = gpioa.pa12.into_alternate();
+            // Use alternative pins on the pre-soldered headers.
+            let rx = gpiob.pb8.into_alternate();
+            let tx = gpiob.pb9.into_alternate();
 
             let can = hal::can::Can::new(cx.device.CAN1, &mut rcc.apb1, (tx, rx));
 
@@ -78,7 +79,9 @@ mod app {
         filters.enable_bank(0, Mask32::accept_all());
         core::mem::drop(filters);
 
-        can.enable_non_blocking();
+        if can.enable_non_blocking().is_err() {
+            defmt::info!("CAN enabling in background...");
+        }
 
         let dac_pin = gpioa.pa4.into_analog();
         let dac = cx.device.DAC;
@@ -99,8 +102,7 @@ mod app {
     //TODO test and see if we can remove this without removing RTT
     #[idle]
     fn idle(_ctx: idle::Context) -> ! {
-        loop {
-        }
+        loop {}
     }
 
     use crate::read_can;
@@ -118,6 +120,12 @@ mod app {
 
 /// Writes 0-5V to the ESC.
 fn write_throttle(_cx: app::write_throttle::Context, throttle: u8) {
+    // This should be a percent, so just throw out invalid values
+    if throttle < !100 {
+        defmt::debug!("Ignoring invalid throttle percent");
+        return;
+    }
+
     let dac = _cx.local.dac;
 
     //Percent of 3.3V
