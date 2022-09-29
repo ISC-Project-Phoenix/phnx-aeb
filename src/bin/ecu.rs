@@ -5,12 +5,13 @@ use hal::dac::DacOut;
 use phnx_throttle as _;
 // global logger + panicking-behavior + memory layout
 use stm32f7xx_hal as hal;
+use stm32f7xx_hal::pac::Interrupt;
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
 
 #[rtic::app(
 device = crate::hal::pac,
-dispatchers = [SDMMC1]
+dispatchers = [SDMMC1, DCMI]
 )]
 mod app {
     use super::hal;
@@ -70,8 +71,8 @@ mod app {
 
             bxcan::Can::builder(can)
                 // APB1 (PCLK1): 130MHz, Bit rate: 250kBit/s, Sample Point 87.5%
-                .set_bit_timing(0x00050040)
-                .leave_disabled()
+                .set_bit_timing(0x001e_000b) //TODO only works with 0x001e_000b
+                .enable()
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
@@ -79,9 +80,9 @@ mod app {
         filters.enable_bank(0, Mask32::accept_all());
         core::mem::drop(filters);
 
-        if can.enable_non_blocking().is_err() {
-            defmt::info!("CAN enabling in background...");
-        }
+        //if can.enable_non_blocking().is_err() {
+        //    defmt::info!("CAN enabling in background...");
+        //}
 
         let dac_pin = gpioa.pa4.into_analog();
         let dac = cx.device.DAC;
@@ -91,6 +92,8 @@ mod app {
         // Ye-old debug LED
         let mut led = gpiob.pb7.into_push_pull_output();
         led.set_high();
+
+        read_can::spawn().unwrap();
 
         (
             Shared {},
@@ -113,7 +116,7 @@ mod app {
         #[task(local = [dac], capacity = 5, priority = 2)]
         fn write_throttle(_cx: write_throttle::Context, throttle: u8);
 
-        #[task(binds = CAN1_RX0, local = [can], priority = 1)]
+        #[task(local = [can], priority = 1)]
         fn read_can(_cx: read_can::Context);
     }
 }
@@ -121,7 +124,7 @@ mod app {
 /// Writes 0-5V to the ESC.
 fn write_throttle(_cx: app::write_throttle::Context, throttle: u8) {
     // This should be a percent, so just throw out invalid values
-    if throttle < !100 {
+    if throttle > 100 {
         defmt::debug!("Ignoring invalid throttle percent");
         return;
     }
@@ -142,11 +145,16 @@ fn read_can(_cx: app::read_can::Context) {
 
     let can = _cx.local.can;
 
-    if let Ok(frame) = can.receive() {
-        let percent = u8::from_le_bytes(frame.data().unwrap()[..0].try_into().unwrap());
+    loop {
+        if let Ok(frame) = can.receive() {
+            defmt::trace!("Got a frame!");
+            let percent = u8::from_le_bytes(frame.data().unwrap()[..1].try_into().unwrap());
 
-        defmt::debug!("Got frame percent: {}", percent);
+            defmt::debug!("Got frame percent: {}", percent);
 
-        app::write_throttle::spawn(percent).unwrap();
+            app::write_throttle::spawn(percent).unwrap();
+        } else {
+            //defmt::trace!("Lost a frame :(");
+        }
     }
 }
