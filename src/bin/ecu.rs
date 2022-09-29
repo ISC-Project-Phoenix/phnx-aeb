@@ -1,11 +1,18 @@
+//! Program that takes throttle messages from CAN and outputs a voltage 0-3.1V from DAC, to
+//! control the ESC.
+//!
+//! Author: Andrew Ealovega
+
 #![no_main]
 #![no_std]
 
 use hal::dac::DacOut;
-use phnx_throttle as _;
+
 // global logger + panicking-behavior + memory layout
+use phnx_throttle as _;
+
 use stm32f7xx_hal as hal;
-use stm32f7xx_hal::prelude::{_embedded_hal_digital_ToggleableOutputPin, OutputPin};
+use stm32f7xx_hal::prelude::_embedded_hal_digital_ToggleableOutputPin;
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
 
@@ -23,9 +30,6 @@ mod app {
     use bxcan::filter::Mask32;
 
     use stm32f7xx_hal::{
-        can::Can,
-        pac,
-        prelude::*,
         rcc::{HSEClock, HSEClockMode},
     };
     use stm32f7xx_hal::gpio::{Output, Pin};
@@ -74,18 +78,19 @@ mod app {
             bxcan::Can::builder(can)
                 // APB1 (PCLK1): 130MHz, Bit rate: 512kBit/s, Sample Point 87.5%
                 .set_bit_timing(0x001e_000b)
-                .enable()
+                .leave_disabled()
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
         let mut filters = can.modify_filters();
-        filters.enable_bank(0, Mask32::accept_all());
+        filters.enable_bank(0, Mask32::accept_all()); //TODO only accept throttle messages when defined
         core::mem::drop(filters);
 
-        //if can.enable_non_blocking().is_err() {
-        //    defmt::info!("CAN enabling in background...");
-        //}
+        if can.enable_non_blocking().is_err() {
+            defmt::info!("CAN enabling in background...");
+        }
 
+        // Configure DAC output
         let dac_pin = gpioa.pa4.into_analog();
         let dac = cx.device.DAC;
         let mut dac = hal::dac::dac(dac, dac_pin);
@@ -102,12 +107,6 @@ mod app {
         )
     }
 
-    //TODO test and see if we can remove this without removing RTT
-    #[idle]
-    fn idle(_ctx: idle::Context) -> ! {
-        loop {}
-    }
-
     use crate::read_can;
     use crate::write_throttle;
 
@@ -121,7 +120,7 @@ mod app {
     }
 }
 
-/// Writes 0-5V to the ESC.
+/// Writes 0-3.1V to the ESC, with the percent passed to the task.
 fn write_throttle(_cx: app::write_throttle::Context, throttle: u8) {
     // This should be a percent, so just throw out invalid values
     if throttle > 100 {
@@ -131,7 +130,7 @@ fn write_throttle(_cx: app::write_throttle::Context, throttle: u8) {
 
     let dac = _cx.local.dac;
 
-    //Percent of 3.3V
+    //Percent of 3.1V
     let out_val = (throttle as f32 / 100.0) * 4092.0;
 
     defmt::trace!("Writing {} to DAC", out_val as u16);
@@ -150,6 +149,7 @@ fn read_can(_cx: app::read_can::Context) {
     let can = _cx.local.can;
 
     if let Ok(frame) = can.receive() {
+        //Percent should be encoded in the first data byte
         let percent = u8::from_le_bytes(frame.data().unwrap()[..1].try_into().unwrap());
 
         defmt::trace!("Got frame percent: {}", percent);
