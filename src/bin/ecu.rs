@@ -6,6 +6,7 @@
 #![no_main]
 #![no_std]
 
+use bxcan::{ExtendedId, Frame, Id};
 use hal::dac::DacOut;
 
 // global logger + panicking-behavior + memory layout
@@ -28,6 +29,7 @@ mod app {
     use systick_monotonic::*;
     use systick_monotonic::fugit::RateExtU32;
     use bxcan::filter::Mask32;
+    use bxcan::ExtendedId;
 
     use stm32f7xx_hal::{
         rcc::{HSEClock, HSEClockMode},
@@ -82,8 +84,9 @@ mod app {
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
+        // Accept only throttle messages
         let mut filters = can.modify_filters();
-        filters.enable_bank(0, Mask32::accept_all()); //TODO only accept throttle messages when defined
+        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
