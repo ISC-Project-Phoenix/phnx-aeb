@@ -6,7 +6,6 @@
 #![no_main]
 #![no_std]
 
-use bxcan::{ExtendedId, Frame, Id};
 use hal::dac::DacOut;
 
 // global logger + panicking-behavior + memory layout
@@ -37,7 +36,7 @@ mod app {
     use stm32f7xx_hal::gpio::{Output, Pin};
 
     #[monotonic(binds = SysTick, default = true)]
-    type Mono = Systick<100>;
+    type Mono = Systick<1000>;
 
     #[shared]
     struct Shared {}
@@ -78,8 +77,7 @@ mod app {
             let can = hal::can::Can::new(cx.device.CAN1, &mut rcc.apb1, (tx, rx));
 
             bxcan::Can::builder(can)
-                // APB1 (PCLK1): 54MHz, Bit rate: 250kBit/s, Sample Point 87.5%
-                .set_bit_timing(0x001e_000b) //1mb: 0x001e0002, 250k: 0x001e000, 500kb: 0x001e0005
+                .set_bit_timing(0x001e0005) //1mb: 0x001e0002, 250k: 0x001e000, 500kb: 0x001e0005
                 .leave_disabled()
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
