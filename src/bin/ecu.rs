@@ -1,17 +1,14 @@
-//! Program that takes throttle messages from CAN and outputs a voltage 0-3.1V from DAC, to
-//! control the ESC.
-//!
-//! Author: Andrew Ealovega
-
 #![no_main]
 #![no_std]
 
-use hal::dac::DacOut;
+//Needed for memory and panic handler
+use phnx_aeb as _;
 
-// global logger + panicking-behavior + memory layout
-use phnx_throttle as _;
-
+use hal::timer::PwmExt;
+use ld06_embed::error::ParseError;
+use ld06_embed::nb;
 use stm32f7xx_hal as hal;
+use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
 use stm32f7xx_hal::prelude::_embedded_hal_digital_ToggleableOutputPin;
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
@@ -21,31 +18,37 @@ device = crate::hal::pac,
 dispatchers = [SDMMC1, DCMI]
 )]
 mod app {
-    use super::hal;
-    use crate::Can1;
-    use stm32f7xx_hal::rcc::RccExt;
-    use stm32f7xx_hal::dac::DacPin;
-    use systick_monotonic::*;
-    use systick_monotonic::fugit::RateExtU32;
-    use bxcan::filter::Mask32;
     use bxcan::ExtendedId;
-
+    use bxcan::filter::Mask32;
     use stm32f7xx_hal::{
         rcc::{HSEClock, HSEClockMode},
     };
     use stm32f7xx_hal::gpio::{Output, Pin};
+    use stm32f7xx_hal::rcc::RccExt;
+    use stm32f7xx_hal::serial::{DataBits, Parity, Rx, Event};
+    use systick_monotonic::*;
+    use systick_monotonic::fugit::RateExtU32;
+
+    use crate::Can1;
+    use stm32f7xx_hal::pac::{TIM1, UART4};
+    use crate::read_can;
+    use ld06_embed::*;
+
+    use super::*;
+    use super::hal;
 
     #[monotonic(binds = SysTick, default = true)]
-    type Mono = Systick<1000>;
+    type Mono = Systick<100>;
 
     #[shared]
     struct Shared {}
 
     #[local]
     struct Local {
-        dac: hal::dac::C1,
         can: Can1,
         led: Pin<'B', 7, Output>,
+        lidar_pwm: stm32f7xx_hal::timer::pwm::PwmChannel<TIM1, 0>,
+        lidar: LD06Pid<Rx<UART4>>,
     }
 
     #[init]
@@ -68,7 +71,10 @@ mod app {
 
         let gpioa = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOA);
         let gpiob = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOB);
+        let gpioe = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOE);
+        let gpiod = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOD);
 
+        // CAN SETUP
         let mut can = {
             // Use alternative pins on the pre-soldered headers.
             let rx = gpiob.pb8.into_alternate();
@@ -82,65 +88,77 @@ mod app {
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
-        // Accept only throttle messages
         let mut filters = can.modify_filters();
+        //TODO change this to steering and encoder ID
         filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
             defmt::info!("CAN enabling in background...");
         }
-
-        // Configure DAC output
-        let dac_pin = gpioa.pa4.into_analog();
-        let dac = cx.device.DAC;
-        let mut dac = hal::dac::dac(dac, dac_pin);
-        dac.enable();
+        // END CAN
 
         // Ye-old debug LED
         let mut led = gpiob.pb7.into_push_pull_output();
         led.set_high();
 
+        //PWM SETUP
+        let (mut ch1, _ch2) = {
+            let pe9 = gpioe.pe9.into_alternate();
+            let pe11 = gpioe.pe11.into_alternate();
+            let channels = (pe9, pe11);
+            cx.device.TIM1.pwm_hz(channels, 24.kHz(), &_clocks).split()
+        };
+        ch1.enable();
+        //TODO set to 26% to start LiDAR
+        //END PWM
+
+        //UART SETUP
+        let (_, rx) = {
+            let tx = gpiod.pd1.into_alternate();
+            let rx = gpiod.pd0.into_alternate();
+
+            let mut serial = Serial::new(
+                cx.device.UART4,
+                (tx, rx),
+                &_clocks,
+                serial::Config {
+                    baud_rate: 230_400.bps(),
+                    data_bits: DataBits::Bits8,
+                    parity: Parity::ParityNone,
+                    ..Default::default()
+                },
+            );
+            // Call interrupt when new data is available (I think)
+            serial.listen(Event::Rxne);
+            serial.split()
+        };
+        //END UART
+
+        let ld06 = LD06::new(rx).into_pid();
+
         (
             Shared {},
-            Local { dac, can, led },
+            Local { can, led, lidar_pwm: ch1, lidar: ld06 },
             init::Monotonics(mono),
         )
     }
 
-    use crate::read_can;
-    use crate::write_throttle;
+    use super::lidar_read;
 
-    //Extern tasks to make the autocomplete work
     extern "Rust" {
-        #[task(local = [dac], capacity = 5, priority = 2)]
-        fn write_throttle(_cx: write_throttle::Context, throttle: u8);
-
-        #[task(binds = CAN1_RX0, local = [can, led], priority = 1)]
+        #[task(binds = CAN1_RX0, local = [can, led], priority = 2)]
         fn read_can(_cx: read_can::Context);
+
+        #[task(binds = UART4, local = [lidar_pwm, lidar], priority = 1)]
+        fn lidar_read(_cx: lidar_read::Context);
     }
 }
 
-/// Writes 0-3.1V to the ESC, with the percent passed to the task.
-fn write_throttle(_cx: app::write_throttle::Context, throttle: u8) {
-    // This should be a percent, so just throw out invalid values
-    if throttle > 100 {
-        defmt::error!("Ignoring invalid throttle percent");
-        return;
-    }
-
-    let dac = _cx.local.dac;
-
-    //Percent of 3.1V
-    let out_val = (throttle as f32 / 100.0) * 4092.0;
-
-    defmt::trace!("Writing {} to DAC", out_val as u16);
-
-    dac.set_value(out_val as u16);
-}
-
-/// Receives CAN frame on interrupt, then starts throttle write.
+/// Receives CAN frame on interrupt, either a velocity value to update or a steering value
 fn read_can(_cx: app::read_can::Context) {
+    //TODO redo for encoder and steering frames later
+
     defmt::trace!("CAN interrupt fired");
 
     // How else could we know we got a frame?
@@ -148,15 +166,31 @@ fn read_can(_cx: app::read_can::Context) {
     led.toggle();
 
     let can = _cx.local.can;
+}
 
-    if let Ok(frame) = can.receive() {
-        //Percent should be encoded in the first data byte
-        let percent = u8::from_le_bytes(frame.data().unwrap()[..1].try_into().unwrap());
+/// Called when the lidar has a new byte to read. Will spawn the AEB software task if a full scan is read.
+fn lidar_read(_cx: app::lidar_read::Context) {
+    let lidar = _cx.local.lidar;
 
-        defmt::trace!("Got frame percent: {}", percent);
-
-        app::write_throttle::spawn(percent).unwrap();
-    } else {
-        defmt::error!("Lost a frame :(");
+    match lidar.read_next_byte() {
+        Ok(Some((scan, pid_update))) => {
+            //TODO if scan received use pwm and spawn aeb task. Also use PID
+        }
+        Err(err) => {
+            match err {
+                nb::Error::Other(err) => {
+                    match err {
+                        ParseError::SerialErr => {
+                            defmt::error!("Serial error");
+                        }
+                        ParseError::CrcFail => {
+                            defmt::error!("CRC error");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }

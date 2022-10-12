@@ -13,7 +13,7 @@ name = "test"
 harness = false
 
 [dependencies]
-phnx-throttle = { path = ".." }
+phnx-aeb = { path = ".." }
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 defmt = "0.3.0"

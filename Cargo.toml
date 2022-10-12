@@ -1,6 +1,6 @@
 [package]
 authors = ["Andrew Ealovega <Andrew@Ealovega.dev>"]
-name = "phnx-throttle"
+name = "phnx-aeb"
 edition = "2021"
 version = "0.1.0"
 
@@ -15,6 +15,9 @@ cortex-m-rtic = "1.1"
 cortex-m = "0.7"
 systick-monotonic = "1.0.0"
 bxcan = "0.6.0" #must pin because of hal limit
+
+# My LiDAR driver
+ld06-embed = { path = "../LD06-embed" }
 
 [dependencies.stm32f7xx-hal]
 version = "0.7.0"
