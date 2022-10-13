@@ -6,7 +6,7 @@ use phnx_aeb as _;
 
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
-use ld06_embed::nb;
+use ld06_embed::{LD06Pid, nb};
 use stm32f7xx_hal as hal;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
 use stm32f7xx_hal::prelude::_embedded_hal_digital_ToggleableOutputPin;
@@ -38,10 +38,15 @@ mod app {
     use super::hal;
 
     #[monotonic(binds = SysTick, default = true)]
-    type Mono = Systick<100>;
+    type Mono = Systick<1000>;
 
     #[shared]
-    struct Shared {}
+    struct Shared {
+        /// The current velocity in m/s
+        velocity: f32,
+        /// The current steering angle of the virtual ackermann wheel
+        steering_angle: f32,
+    }
 
     #[local]
     struct Local {
@@ -110,7 +115,6 @@ mod app {
             cx.device.TIM1.pwm_hz(channels, 24.kHz(), &_clocks).split()
         };
         ch1.enable();
-        //TODO set to 26% to start LiDAR
         //END PWM
 
         //UART SETUP
@@ -137,8 +141,11 @@ mod app {
 
         let ld06 = LD06::new(rx).into_pid();
 
+        //Start LiDAR motor with a reasonable value
+        ch1.set_duty((ch1.get_max_duty() as f32 * 0.26) as u16);
+
         (
-            Shared {},
+            Shared { velocity: 0.0, steering_angle: 0.0 },
             Local { can, led, lidar_pwm: ch1, lidar: ld06 },
             init::Monotonics(mono),
         )
@@ -147,7 +154,7 @@ mod app {
     use super::lidar_read;
 
     extern "Rust" {
-        #[task(binds = CAN1_RX0, local = [can, led], priority = 2)]
+        #[task(binds = CAN1_RX0, local = [can, led], shared = [velocity, steering_angle], priority = 2)]
         fn read_can(_cx: read_can::Context);
 
         #[task(binds = UART4, local = [lidar_pwm, lidar], priority = 1)]
@@ -157,7 +164,7 @@ mod app {
 
 /// Receives CAN frame on interrupt, either a velocity value to update or a steering value
 fn read_can(_cx: app::read_can::Context) {
-    //TODO redo for encoder and steering frames later
+    //TODO redo for encoder and steering frames later, read vel and steering angle, convert steering angle to ackermann wheel
 
     defmt::trace!("CAN interrupt fired");
 
@@ -171,10 +178,25 @@ fn read_can(_cx: app::read_can::Context) {
 /// Called when the lidar has a new byte to read. Will spawn the AEB software task if a full scan is read.
 fn lidar_read(_cx: app::lidar_read::Context) {
     let lidar = _cx.local.lidar;
+    let pwm = _cx.local.lidar_pwm;
 
     match lidar.read_next_byte() {
         Ok(Some((scan, pid_update))) => {
-            //TODO if scan received use pwm and spawn aeb task. Also use PID
+            defmt::trace!("Received full scan");
+
+            // Update speed of the LiDAR motor using the new PID value
+            if pid_update != 0 {
+                let speed_perc = (lidar.get_max_lidar_speed() / pid_update) as f32;
+                pwm.set_duty((pwm.get_max_duty() as f32 * speed_perc) as u16);
+
+                defmt::trace!("Set lidar speed to {}%", speed_perc);
+            }
+
+            // Accept any scans that could have any points in our grid
+            if (scan.start_angle >= (360.0 - 25.0) && scan.start_angle <= 360.0) || (scan.start_angle <= 25.0 && scan.start_angle >= 0.0) {
+                defmt::trace!("Accepted scan");
+                //TODO spawn AEB task with scan
+            }
         }
         Err(err) => {
             match err {
