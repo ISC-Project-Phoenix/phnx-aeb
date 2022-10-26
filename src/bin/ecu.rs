@@ -193,9 +193,12 @@ fn lidar_read(_cx: app::lidar_read::Context) {
             }
 
             // Accept any scans that could have any points in our grid
-            if (scan.start_angle >= (360.0 - 25.0) && scan.start_angle <= 360.0) || (scan.start_angle <= 25.0 && scan.start_angle >= 0.0) {
+            if (360.0 - 25.0..=360.0).contains(&scan.start_angle)
+                || (..=25.0).contains(&scan.start_angle)
+                || (360.0 - 25.0..=360.0).contains(&scan.end_angle)
+                || (..=25.0).contains(&scan.end_angle) {
                 defmt::trace!("Accepted scan");
-                //TODO spawn AEB task with scan
+                //TODO spawn AEB task with scan, you'll need to fill the grid with scans first before running AEB, else the grid wont be full
             }
         }
         Err(err) => {
