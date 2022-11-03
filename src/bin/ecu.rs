@@ -1,15 +1,19 @@
 #![no_main]
 #![no_std]
 
+use aeb_rs::Aeb;
+use aeb_rs::grid::KartPoint;
 //Needed for memory and panic handler
 use phnx_aeb as _;
 
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
 use ld06_embed::{LD06Pid, nb};
+use rtic::Mutex;
 use stm32f7xx_hal as hal;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
 use stm32f7xx_hal::prelude::_embedded_hal_digital_ToggleableOutputPin;
+use crate::app::run_aeb;
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
 
@@ -18,6 +22,7 @@ device = crate::hal::pac,
 dispatchers = [SDMMC1, DCMI]
 )]
 mod app {
+    use aeb_rs::Aeb;
     use bxcan::ExtendedId;
     use bxcan::filter::Mask32;
     use stm32f7xx_hal::{
@@ -42,10 +47,8 @@ mod app {
 
     #[shared]
     struct Shared {
-        /// The current velocity in m/s
-        velocity: f32,
-        /// The current steering angle of the virtual ackermann wheel
-        steering_angle: f32,
+        /// AEB algorithm
+        aeb: Aeb<51>,
     }
 
     #[local]
@@ -54,6 +57,7 @@ mod app {
         led: Pin<'B', 7, Output>,
         lidar_pwm: stm32f7xx_hal::timer::pwm::PwmChannel<TIM1, 0>,
         lidar: LD06Pid<Rx<UART4>>,
+        last_scan_in_bounds: bool,
     }
 
     #[init]
@@ -93,9 +97,10 @@ mod app {
         };
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
+        // Enable steering and encoder ids
         let mut filters = can.modify_filters();
-        //TODO change this to steering and encoder ID
-        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000004).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(1, Mask32::frames_with_ext_id(ExtendedId::new(0x0000006).unwrap(), ExtendedId::MAX));
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
@@ -144,9 +149,21 @@ mod app {
         //Start LiDAR motor with a reasonable value
         ch1.set_duty((ch1.get_max_duty() as f32 * 0.26) as u16);
 
+        //V len = 202cm
+        //H width = 135cm
+        //Axel to Lidar = 143cm
+        let aeb = Aeb::<51>::new(
+            0.0,
+            0.0,
+            1.08,
+            ((-0.675, 1.43), (0.675, -0.59)),
+            KartPoint(1.43, 0.0),
+            3.0,
+        );
+
         (
-            Shared { velocity: 0.0, steering_angle: 0.0 },
-            Local { can, led, lidar_pwm: ch1, lidar: ld06 },
+            Shared { aeb },
+            Local { can, led, lidar_pwm: ch1, lidar: ld06, last_scan_in_bounds: false },
             init::Monotonics(mono),
         )
     }
@@ -154,31 +171,54 @@ mod app {
     use super::lidar_read;
 
     extern "Rust" {
-        #[task(binds = CAN1_RX0, local = [can, led], shared = [velocity, steering_angle], priority = 2)]
+        #[task(shared = [aeb], priority = 3)]
+        fn run_aeb(_cx: run_aeb::Context);
+
+        #[task(binds = CAN1_RX0, local = [can, led], shared = [aeb], priority = 2)]
         fn read_can(_cx: read_can::Context);
 
-        #[task(binds = UART4, local = [lidar_pwm, lidar], priority = 1)]
+        #[task(binds = UART4, local = [lidar_pwm, lidar, last_scan_in_bounds], shared = [aeb], priority = 1)]
         fn lidar_read(_cx: lidar_read::Context);
     }
 }
 
 /// Receives CAN frame on interrupt, either a velocity value to update or a steering value
 fn read_can(_cx: app::read_can::Context) {
-    //TODO redo for encoder and steering frames later, read vel and steering angle, convert steering angle to ackermann wheel
-
     defmt::trace!("CAN interrupt fired");
+    let mut aeb = _cx.shared.aeb;
 
     // How else could we know we got a frame?
     let led = _cx.local.led;
     led.toggle();
 
     let can = _cx.local.can;
+    let frame = can.receive().unwrap();
+
+    // Lock AEB for write, we only prevent aeb from spawning
+    aeb.lock(|aeb| {
+        if let bxcan::Id::Extended(id) = frame.id() {
+            match id.as_raw() {
+                0x0000004 => {
+                    //TODO covert steering angle to ackermann virtual wheel, then save to AEB
+                    //aeb.update_steering()
+                }
+                0x0000006 => {
+                    //TODO parse encoder velocity, then save to AEB
+                    //aeb.update_velocity()
+                }
+                id => {
+                    defmt::error!("Received invalid CAN id: {:x}", id)
+                }
+            }
+        }
+    });
 }
 
 /// Called when the lidar has a new byte to read. Will spawn the AEB software task if a full scan is read.
-fn lidar_read(_cx: app::lidar_read::Context) {
+fn lidar_read(mut _cx: app::lidar_read::Context) {
     let lidar = _cx.local.lidar;
     let pwm = _cx.local.lidar_pwm;
+    let last = _cx.local.last_scan_in_bounds;
 
     match lidar.read_next_byte() {
         Ok(Some((scan, pid_update))) => {
@@ -192,13 +232,36 @@ fn lidar_read(_cx: app::lidar_read::Context) {
                 defmt::trace!("Set lidar speed to {}%", speed_perc);
             }
 
-            // Accept any scans that could have any points in our grid
+            // Run AEB after we have multiple scans over our desired area
             if (360.0 - 25.0..=360.0).contains(&scan.start_angle)
                 || (..=25.0).contains(&scan.start_angle)
                 || (360.0 - 25.0..=360.0).contains(&scan.end_angle)
                 || (..=25.0).contains(&scan.end_angle) {
                 defmt::trace!("Accepted scan");
-                //TODO spawn AEB task with scan, you'll need to fill the grid with scans first before running AEB, else the grid wont be full
+                *last = true;
+
+                // Add points to AEB. AEB cannot be running while this CS is running, but this is garrentied by priorities.
+                _cx.shared.aeb.lock(|aeb| {
+                    for (i, p) in scan.data.into_iter().enumerate() {
+                        // Filter out close or unlikely points
+                        if p.dist < 150 || p.confidence < 50 {
+                            continue;
+                        }
+
+                        // Convert LiDAR points into standard polar points
+                        let polar = scan.get_range_in_polar(i as u16);
+                        // Transform from polar to cartiesian
+                        let kart = KartPoint::from_polar(polar.0 / 1000.0, polar.1);
+
+                        aeb.add_points(&[kart])
+                    }
+                });
+            }
+            // Spawn AEB if we have had scans in the range, but we now left the range
+            else if *last {
+                *last = false;
+                defmt::trace!("Full scan received, spawning AEB");
+                run_aeb::spawn().unwrap()
             }
         }
         Err(err) => {
@@ -218,4 +281,16 @@ fn lidar_read(_cx: app::lidar_read::Context) {
         }
         _ => {}
     }
+}
+
+/// Runs AEB, popping the e-stop if a collision would occur.
+fn run_aeb(mut _cx: run_aeb::Context) {
+    _cx.shared.aeb.lock(|aeb| {
+        let should_estop = aeb.collision_check(None);
+        defmt::trace!("Collision check result: {}", should_estop);
+
+        if should_estop {
+            //TODO fire estop
+        }
+    })
 }

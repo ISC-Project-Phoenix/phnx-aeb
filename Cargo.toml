@@ -16,7 +16,7 @@ cortex-m = "0.7"
 systick-monotonic = "1.0.0"
 bxcan = "0.6.0" #must pin because of hal limit
 
-# My LiDAR driver
+aeb_rs = { path = "../aeb_rs" }
 ld06-embed = { path = "../LD06-embed" }
 
 [dependencies.stm32f7xx-hal]
