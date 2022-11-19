@@ -99,8 +99,8 @@ mod app {
 
         // Enable steering and encoder ids
         let mut filters = can.modify_filters();
-        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000004).unwrap(), ExtendedId::MAX));
-        filters.enable_bank(1, Mask32::frames_with_ext_id(ExtendedId::new(0x0000006).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(1, Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX));
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
@@ -198,11 +198,11 @@ fn read_can(_cx: app::read_can::Context) {
     aeb.lock(|aeb| {
         if let bxcan::Id::Extended(id) = frame.id() {
             match id.as_raw() {
-                0x0000004 => {
+                0x0000005 => {
                     //TODO covert steering angle to ackermann virtual wheel, then save to AEB
                     //aeb.update_steering()
                 }
-                0x0000006 => {
+                0x0000007 => {
                     //TODO parse encoder velocity, then save to AEB
                     //aeb.update_velocity()
                 }
