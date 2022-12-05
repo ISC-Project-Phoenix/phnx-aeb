@@ -1,14 +1,13 @@
 #![no_main]
 #![no_std]
 
-use aeb_rs::Aeb;
 use aeb_rs::grid::KartPoint;
 //Needed for memory and panic handler
 use phnx_aeb as _;
 
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
-use ld06_embed::{LD06Pid, nb};
+use ld06_embed::{nb};
 use rtic::Mutex;
 use stm32f7xx_hal as hal;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
@@ -138,7 +137,7 @@ mod app {
                     ..Default::default()
                 },
             );
-            // Call interrupt when new data is available (I think)
+            // Call interrupt when new data is available
             serial.listen(Event::Rxne);
             serial.split()
         };
@@ -199,12 +198,20 @@ fn read_can(_cx: app::read_can::Context) {
         if let bxcan::Id::Extended(id) = frame.id() {
             match id.as_raw() {
                 0x0000005 => {
-                    //TODO covert steering angle to ackermann virtual wheel, then save to AEB
-                    //aeb.update_steering()
+                    let raw_angle = f32::from_le_bytes(frame.data().unwrap()[0..3].try_into().unwrap());
+                    defmt::trace!("Read raw steering angle {}", raw_angle);
+
+                    // We need to convert the steering wheel angle to wheel angle
+                    let ackermann_angle = 2.62 * raw_angle + -0.832;
+                    defmt::trace!("Converted to ackermann angle {}", ackermann_angle);
+
+                    aeb.update_steering(ackermann_angle);
                 }
                 0x0000007 => {
-                    //TODO parse encoder velocity, then save to AEB
-                    //aeb.update_velocity()
+                    let vel_ms = f32::from_le_bytes(frame.data().unwrap()[2..6].try_into().unwrap());
+                    defmt::trace!("Updated velocity to {}m/s", vel_ms);
+
+                    aeb.update_velocity(vel_ms);
                 }
                 id => {
                     defmt::error!("Received invalid CAN id: {:x}", id)
@@ -264,19 +271,14 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
                 run_aeb::spawn().unwrap()
             }
         }
-        Err(err) => {
+        Err(nb::Error::Other(err)) => {
             match err {
-                nb::Error::Other(err) => {
-                    match err {
-                        ParseError::SerialErr => {
-                            defmt::error!("Serial error");
-                        }
-                        ParseError::CrcFail => {
-                            defmt::error!("CRC error");
-                        }
-                    }
+                ParseError::SerialErr => {
+                    defmt::error!("Serial error");
                 }
-                _ => {}
+                ParseError::CrcFail => {
+                    defmt::error!("CRC error");
+                }
             }
         }
         _ => {}
@@ -286,10 +288,11 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
 /// Runs AEB, popping the e-stop if a collision would occur.
 fn run_aeb(mut _cx: run_aeb::Context) {
     _cx.shared.aeb.lock(|aeb| {
-        let should_estop = aeb.collision_check(None);
+        let (should_estop, _) = aeb.collision_check(None);
         defmt::trace!("Collision check result: {}", should_estop);
 
         if should_estop {
+            defmt::error!("Firing ESTOP!");
             //TODO fire estop
         }
     })
