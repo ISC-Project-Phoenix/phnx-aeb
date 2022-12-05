@@ -1,9 +1,9 @@
 #![no_main]
 #![no_std]
 
-use aeb_rs::grid::KartPoint;
 //Needed for memory and panic handler
 use phnx_aeb as _;
+use aeb_rs::grid::KartPoint;
 
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
