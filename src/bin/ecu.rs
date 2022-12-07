@@ -2,18 +2,17 @@
 #![no_std]
 
 //Needed for memory and panic handler
-use phnx_aeb as _;
 use aeb_rs::grid::KartPoint;
+use phnx_aeb as _;
 
+use crate::app::run_aeb;
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
-use ld06_embed::{nb};
+use ld06_embed::nb;
 use phnx_candefs::CanMessage;
 use rtic::Mutex;
 use stm32f7xx_hal as hal;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
-use stm32f7xx_hal::prelude::_embedded_hal_digital_ToggleableOutputPin;
-use crate::app::run_aeb;
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
 
@@ -23,24 +22,22 @@ dispatchers = [SDMMC1, DCMI]
 )]
 mod app {
     use aeb_rs::Aeb;
-    use bxcan::{ExtendedId, Fifo};
     use bxcan::filter::Mask32;
-    use stm32f7xx_hal::{
-        rcc::{HSEClock, HSEClockMode},
-    };
+    use bxcan::{ExtendedId, Fifo};
     use stm32f7xx_hal::gpio::{Output, Pin};
     use stm32f7xx_hal::rcc::RccExt;
-    use stm32f7xx_hal::serial::{DataBits, Parity, Rx, Event};
-    use systick_monotonic::*;
+    use stm32f7xx_hal::rcc::{HSEClock, HSEClockMode};
+    use stm32f7xx_hal::serial::{DataBits, Event, Parity, Rx};
     use systick_monotonic::fugit::RateExtU32;
+    use systick_monotonic::*;
 
-    use crate::Can1;
-    use stm32f7xx_hal::pac::{TIM1, UART4};
     use crate::read_can;
+    use crate::Can1;
     use ld06_embed::*;
+    use stm32f7xx_hal::pac::{TIM1, UART4};
 
-    use super::*;
     use super::hal;
+    use super::*;
 
     #[monotonic(binds = SysTick, default = true)]
     type Mono = Systick<1000>;
@@ -78,7 +75,7 @@ mod app {
         let systick = cx.core.SYST;
         let mono = Systick::new(systick, 216_000_000);
 
-        let gpioa = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOA);
+        //let gpioa = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOA);
         let gpiob = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOB);
         let gpioe = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOE);
         let gpiod = hal::prelude::_stm327xx_hal_gpio_GpioExt::split(cx.device.GPIOD);
@@ -99,8 +96,16 @@ mod app {
 
         // Enable steering and encoder ids
         let mut filters = can.modify_filters();
-        filters.enable_bank(0, Fifo::Fifo0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
-        filters.enable_bank(1, Fifo::Fifo0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(
+            0,
+            Fifo::Fifo0,
+            Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX),
+        );
+        filters.enable_bank(
+            1,
+            Fifo::Fifo0,
+            Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX),
+        );
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
@@ -163,7 +168,13 @@ mod app {
 
         (
             Shared { aeb },
-            Local { can, led, lidar_pwm: ch1, lidar: ld06, last_scan_in_bounds: false },
+            Local {
+                can,
+                led,
+                lidar_pwm: ch1,
+                lidar: ld06,
+                last_scan_in_bounds: false,
+            },
             init::Monotonics(mono),
         )
     }
@@ -213,7 +224,9 @@ fn read_can(_cx: app::read_can::Context) {
 
                 aeb.update_velocity(ec.velocity);
             }
-            _ => { defmt::error!("Invalid CAN ID received! This is an error in filters or candefs.") }
+            _ => {
+                defmt::error!("Invalid CAN ID received! This is an error in filters or candefs.")
+            }
         }
     });
 }
@@ -233,14 +246,15 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
                 let speed_perc = (lidar.get_max_lidar_speed() / pid_update) as f32;
                 pwm.set_duty((pwm.get_max_duty() as f32 * speed_perc) as u16);
 
-                defmt::trace!("Set lidar speed to {}%", speed_perc);
+                defmt::trace!("Set lidar speed to ${}$%", speed_perc);
             }
 
             // Run AEB after we have multiple scans over our desired area
             if (360.0 - 25.0..=360.0).contains(&scan.start_angle)
                 || (..=25.0).contains(&scan.start_angle)
                 || (360.0 - 25.0..=360.0).contains(&scan.end_angle)
-                || (..=25.0).contains(&scan.end_angle) {
+                || (..=25.0).contains(&scan.end_angle)
+            {
                 defmt::trace!("Accepted scan");
                 *last = true;
 
@@ -268,16 +282,14 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
                 run_aeb::spawn().unwrap()
             }
         }
-        Err(nb::Error::Other(err)) => {
-            match err {
-                ParseError::SerialErr => {
-                    defmt::error!("Serial error");
-                }
-                ParseError::CrcFail => {
-                    defmt::error!("CRC error");
-                }
+        Err(nb::Error::Other(err)) => match err {
+            ParseError::SerialErr => {
+                defmt::error!("Serial error");
             }
-        }
+            ParseError::CrcFail => {
+                defmt::error!("CRC error");
+            }
+        },
         _ => {}
     }
 }
