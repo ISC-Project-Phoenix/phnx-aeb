@@ -14,14 +14,16 @@ panic-probe = { version = "0.3.0", features = ["print-defmt"] }
 cortex-m-rtic = "1.1"
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 systick-monotonic = "1.0.0"
-bxcan = "0.6.0" #must pin because of hal limit
+bxcan = "0.7.0"
 
 aeb_rs = { path = "../aeb_rs" }
 ld06-embed = { path = "../LD06-embed" }
+phnx-candefs = { git = "https://github.com/ISC-Project-Phoenix/phnx-candefs.git" }
 
 [dependencies.stm32f7xx-hal]
 version = "0.7.0"
 features = ["stm32f767", "rt", "rtic", "has-can"]
+git = "https://github.com/andyblarblar/stm32f7xx-hal.git"
 
 # cargo build/run
 [profile.dev]

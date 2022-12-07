@@ -8,6 +8,7 @@ use aeb_rs::grid::KartPoint;
 use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
 use ld06_embed::{nb};
+use phnx_candefs::CanMessage;
 use rtic::Mutex;
 use stm32f7xx_hal as hal;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
@@ -22,7 +23,7 @@ dispatchers = [SDMMC1, DCMI]
 )]
 mod app {
     use aeb_rs::Aeb;
-    use bxcan::ExtendedId;
+    use bxcan::{ExtendedId, Fifo};
     use bxcan::filter::Mask32;
     use stm32f7xx_hal::{
         rcc::{HSEClock, HSEClockMode},
@@ -98,8 +99,8 @@ mod app {
 
         // Enable steering and encoder ids
         let mut filters = can.modify_filters();
-        filters.enable_bank(0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
-        filters.enable_bank(1, Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(0, Fifo::Fifo0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX));
+        filters.enable_bank(1, Fifo::Fifo0, Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX));
         core::mem::drop(filters);
 
         if can.enable_non_blocking().is_err() {
@@ -195,28 +196,24 @@ fn read_can(_cx: app::read_can::Context) {
 
     // Lock AEB for write, we only prevent aeb from spawning
     aeb.lock(|aeb| {
-        if let bxcan::Id::Extended(id) = frame.id() {
-            match id.as_raw() {
-                0x0000005 => {
-                    let raw_angle = f32::from_le_bytes(frame.data().unwrap()[0..3].try_into().unwrap());
-                    defmt::trace!("Read raw steering angle {}", raw_angle);
+        let conv = CanMessage::from_frame(frame).unwrap();
 
-                    // We need to convert the steering wheel angle to wheel angle
-                    let ackermann_angle = 2.62 * raw_angle + -0.832;
-                    defmt::trace!("Converted to ackermann angle {}", ackermann_angle);
+        match conv {
+            CanMessage::GetAngle(angle) => {
+                defmt::trace!("Read raw steering angle {}", angle.angle);
 
-                    aeb.update_steering(ackermann_angle);
-                }
-                0x0000007 => {
-                    let vel_ms = f32::from_le_bytes(frame.data().unwrap()[2..6].try_into().unwrap());
-                    defmt::trace!("Updated velocity to {}m/s", vel_ms);
+                // We need to convert the steering wheel angle to wheel angle
+                let ackermann_angle = angle.ackermann_angle();
+                defmt::trace!("Converted to ackermann angle {}", ackermann_angle);
 
-                    aeb.update_velocity(vel_ms);
-                }
-                id => {
-                    defmt::error!("Received invalid CAN id: {:x}", id)
-                }
+                aeb.update_steering(ackermann_angle);
             }
+            CanMessage::EncoderCount(ec) => {
+                defmt::trace!("Updated velocity to {}m/s", ec.velocity);
+
+                aeb.update_velocity(ec.velocity);
+            }
+            _ => { defmt::error!("Invalid CAN ID received! This is an error in filters or candefs.") }
         }
     });
 }
