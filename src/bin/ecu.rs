@@ -12,6 +12,7 @@ use ld06_embed::nb;
 use phnx_candefs::CanMessage;
 use rtic::Mutex;
 use stm32f7xx_hal as hal;
+use stm32f7xx_hal::serial::Error;
 use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
@@ -45,7 +46,7 @@ mod app {
     #[shared]
     struct Shared {
         /// AEB algorithm
-        aeb: Aeb<51>,
+        aeb: Aeb<31>,
     }
 
     #[local]
@@ -157,7 +158,7 @@ mod app {
         //V len = 202cm
         //H width = 135cm
         //Axel to Lidar = 143cm
-        let aeb = Aeb::<51>::new(
+        let aeb = Aeb::<31>::new(
             0.0,
             0.0,
             1.08,
@@ -182,13 +183,14 @@ mod app {
     use super::lidar_read;
 
     extern "Rust" {
-        #[task(shared = [aeb], priority = 3)]
+        #[task(shared = [aeb], priority = 2)]
         fn run_aeb(_cx: run_aeb::Context);
 
-        #[task(binds = CAN1_RX0, local = [can, led], shared = [aeb], priority = 2)]
+        #[task(binds = CAN1_RX0, local = [can, led], shared = [aeb], priority = 1)]
         fn read_can(_cx: read_can::Context);
 
-        #[task(binds = UART4, local = [lidar_pwm, lidar, last_scan_in_bounds], shared = [aeb], priority = 1)]
+        // This needs to be highest priority, else running AEB causes the rx buffer to overrun
+        #[task(binds = UART4, local = [lidar_pwm, lidar, last_scan_in_bounds], shared = [aeb], priority = 3)]
         fn lidar_read(_cx: lidar_read::Context);
     }
 }
@@ -239,14 +241,22 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
 
     match lidar.read_next_byte() {
         Ok(Some((scan, pid_update))) => {
-            defmt::trace!("Received full scan");
+            defmt::trace!(
+                "Received scan: start: {} end: {}",
+                scan.start_angle,
+                scan.end_angle
+            );
 
             // Update speed of the LiDAR motor using the new PID value
             if pid_update != 0 {
-                let speed_perc = (lidar.get_max_lidar_speed() / pid_update) as f32;
+                let speed_perc = pid_update as f32 / lidar.get_max_lidar_speed() as f32;
                 pwm.set_duty((pwm.get_max_duty() as f32 * speed_perc) as u16);
 
-                defmt::trace!("Set lidar speed to ${}$%", speed_perc);
+                /*defmt::trace!(
+                    "Set lidar speed to ${}$%, speed was %{}%",
+                    speed_perc * 100.0,
+                    (scan.radar_speed as f32 / lidar.get_max_lidar_speed() as f32) * 100.0
+                );*/
             }
 
             // Run AEB after we have multiple scans over our desired area
@@ -262,7 +272,7 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
                 _cx.shared.aeb.lock(|aeb| {
                     for (i, p) in scan.data.into_iter().enumerate() {
                         // Filter out close or unlikely points
-                        if p.dist < 150 || p.confidence < 50 {
+                        if p.dist < 150 || p.confidence < 150 {
                             continue;
                         }
 
@@ -279,13 +289,32 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
             else if *last {
                 *last = false;
                 defmt::trace!("Full scan received, spawning AEB");
-                run_aeb::spawn().unwrap()
+
+                /*_cx.shared.aeb.lock(|aeb| {
+                    defmt::debug!("{}", defmt::Display2Format(&aeb));
+                });*/
+
+                run_aeb::spawn().unwrap();
             }
         }
         Err(nb::Error::Other(err)) => match err {
-            ParseError::SerialErr => {
-                defmt::error!("Serial error");
-            }
+            ParseError::SerialErr(err) => match err {
+                Error::Framing => {
+                    defmt::error!("Serial framing error");
+                }
+                Error::Noise => {
+                    defmt::error!("Serial noise error");
+                }
+                Error::Overrun => {
+                    defmt::error!("Serial overrun error");
+                }
+                Error::Parity => {
+                    defmt::error!("Serial parity error");
+                }
+                _ => {
+                    defmt::error!("Unknown serial error");
+                }
+            },
             ParseError::CrcFail => {
                 defmt::error!("CRC error");
             }
@@ -297,12 +326,15 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
 /// Runs AEB, popping the e-stop if a collision would occur.
 fn run_aeb(mut _cx: run_aeb::Context) {
     _cx.shared.aeb.lock(|aeb| {
-        let (should_estop, _) = aeb.collision_check(None);
+        let (should_estop, time) = aeb.collision_check(None);
         defmt::trace!("Collision check result: {}", should_estop);
 
         if should_estop {
-            defmt::error!("Firing ESTOP!");
+            defmt::info!(
+                "Firing ESTOP! at dist {}m",
+                (time as f32 / 1000.0) / aeb.get_velocity()
+            );
             //TODO fire estop
         }
-    })
+    });
 }
