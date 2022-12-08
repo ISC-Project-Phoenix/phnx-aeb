@@ -6,16 +6,19 @@ use aeb_rs::grid::KartPoint;
 use phnx_aeb as _;
 
 use crate::app::run_aeb;
-use hal::timer::PwmExt;
 use ld06_embed::error::ParseError;
 use ld06_embed::nb;
+use ld06_embed::PartialScan;
 use phnx_candefs::CanMessage;
 use rtic::Mutex;
 use stm32f7xx_hal as hal;
+use stm32f7xx_hal::prelude::*;
 use stm32f7xx_hal::serial::Error;
-use stm32f7xx_hal::{prelude::*, serial, serial::Serial};
 
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
+
+/// AEB resolution
+const AEB_SIZE: usize = 31;
 
 #[rtic::app(
 device = crate::hal::pac,
@@ -28,13 +31,15 @@ mod app {
     use stm32f7xx_hal::gpio::{Output, Pin};
     use stm32f7xx_hal::rcc::RccExt;
     use stm32f7xx_hal::rcc::{HSEClock, HSEClockMode};
-    use stm32f7xx_hal::serial::{DataBits, Event, Parity, Rx};
+    use stm32f7xx_hal::serial::{DataBits, Event, Parity, Rx, Serial};
     use systick_monotonic::fugit::RateExtU32;
     use systick_monotonic::*;
 
     use crate::read_can;
     use crate::Can1;
+    use ld06_embed::PartialScan;
     use ld06_embed::*;
+    use phnx_candefs::{EncoderCount, GetAngle, IscFrame};
     use stm32f7xx_hal::pac::{TIM1, UART4};
 
     use super::hal;
@@ -46,7 +51,7 @@ mod app {
     #[shared]
     struct Shared {
         /// AEB algorithm
-        aeb: Aeb<31>,
+        aeb: Aeb<AEB_SIZE>,
     }
 
     #[local]
@@ -100,12 +105,12 @@ mod app {
         filters.enable_bank(
             0,
             Fifo::Fifo0,
-            Mask32::frames_with_ext_id(ExtendedId::new(0x0000005).unwrap(), ExtendedId::MAX),
+            Mask32::frames_with_ext_id(ExtendedId::new(GetAngle::ID).unwrap(), ExtendedId::MAX),
         );
         filters.enable_bank(
             1,
             Fifo::Fifo0,
-            Mask32::frames_with_ext_id(ExtendedId::new(0x0000007).unwrap(), ExtendedId::MAX),
+            Mask32::frames_with_ext_id(ExtendedId::new(EncoderCount::ID).unwrap(), ExtendedId::MAX),
         );
         core::mem::drop(filters);
 
@@ -137,7 +142,7 @@ mod app {
                 cx.device.UART4,
                 (tx, rx),
                 &_clocks,
-                serial::Config {
+                hal::serial::Config {
                     baud_rate: 230_400.bps(),
                     data_bits: DataBits::Bits8,
                     parity: Parity::ParityNone,
@@ -158,7 +163,7 @@ mod app {
         //V len = 202cm
         //H width = 135cm
         //Axel to Lidar = 143cm
-        let aeb = Aeb::<31>::new(
+        let aeb = Aeb::<AEB_SIZE>::new(
             0.0,
             0.0,
             1.08,
@@ -183,15 +188,18 @@ mod app {
     use super::lidar_read;
 
     extern "Rust" {
-        #[task(shared = [aeb], priority = 2)]
+        #[task(capacity = 3, shared = [aeb], priority = 3)]
         fn run_aeb(_cx: run_aeb::Context);
 
         #[task(binds = CAN1_RX0, local = [can, led], shared = [aeb], priority = 1)]
         fn read_can(_cx: read_can::Context);
 
         // This needs to be highest priority, else running AEB causes the rx buffer to overrun
-        #[task(binds = UART4, local = [lidar_pwm, lidar, last_scan_in_bounds], shared = [aeb], priority = 3)]
+        #[task(binds = UART4, local = [lidar_pwm, lidar], priority = 4)]
         fn lidar_read(_cx: lidar_read::Context);
+
+        #[task(capacity = 32, shared = [aeb], local = [last_scan_in_bounds], priority = 2)]
+        fn handle_lidar_scan(_cx: handle_lidar_scan::Context, scan: PartialScan);
     }
 }
 
@@ -205,39 +213,43 @@ fn read_can(_cx: app::read_can::Context) {
     led.toggle();
 
     let can = _cx.local.can;
-    let frame = can.receive().unwrap();
 
-    // Lock AEB for write, we only prevent aeb from spawning
-    aeb.lock(|aeb| {
-        let conv = CanMessage::from_frame(frame).unwrap();
+    if let Ok(frame) = can.receive() {
+        // Lock AEB for write, we only prevent aeb from spawning
+        aeb.lock(|aeb| {
+            let conv = CanMessage::from_frame(frame).unwrap();
 
-        match conv {
-            CanMessage::GetAngle(angle) => {
-                defmt::trace!("Read raw steering angle {}", angle.angle);
+            match conv {
+                CanMessage::GetAngle(angle) => {
+                    defmt::trace!("Read raw steering angle {}", angle.angle);
 
-                // We need to convert the steering wheel angle to wheel angle
-                let ackermann_angle = angle.ackermann_angle();
-                defmt::trace!("Converted to ackermann angle {}", ackermann_angle);
+                    // We need to convert the steering wheel angle to wheel angle
+                    let ackermann_angle = angle.ackermann_angle();
+                    defmt::trace!("Converted to ackermann angle {}", ackermann_angle);
 
-                aeb.update_steering(ackermann_angle);
+                    aeb.update_steering(ackermann_angle);
+                }
+                CanMessage::EncoderCount(ec) => {
+                    defmt::trace!("Updated velocity to {}m/s", ec.velocity);
+
+                    aeb.update_velocity(ec.velocity);
+                }
+                _ => {
+                    defmt::error!(
+                        "Invalid CAN ID received! This is an error in filters or candefs."
+                    )
+                }
             }
-            CanMessage::EncoderCount(ec) => {
-                defmt::trace!("Updated velocity to {}m/s", ec.velocity);
-
-                aeb.update_velocity(ec.velocity);
-            }
-            _ => {
-                defmt::error!("Invalid CAN ID received! This is an error in filters or candefs.")
-            }
-        }
-    });
+        });
+    } else {
+        defmt::error!("Dropped CAN frame!")
+    }
 }
 
-/// Called when the lidar has a new byte to read. Will spawn the AEB software task if a full scan is read.
+/// Called when the lidar has a new byte to read. Will spawn a handler when a complete scan is received.
 fn lidar_read(mut _cx: app::lidar_read::Context) {
     let lidar = _cx.local.lidar;
     let pwm = _cx.local.lidar_pwm;
-    let last = _cx.local.last_scan_in_bounds;
 
     match lidar.read_next_byte() {
         Ok(Some((scan, pid_update))) => {
@@ -251,51 +263,10 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
             if pid_update != 0 {
                 let speed_perc = pid_update as f32 / lidar.get_max_lidar_speed() as f32;
                 pwm.set_duty((pwm.get_max_duty() as f32 * speed_perc) as u16);
-
-                /*defmt::trace!(
-                    "Set lidar speed to ${}$%, speed was %{}%",
-                    speed_perc * 100.0,
-                    (scan.radar_speed as f32 / lidar.get_max_lidar_speed() as f32) * 100.0
-                );*/
             }
 
-            // Run AEB after we have multiple scans over our desired area
-            if (360.0 - 25.0..=360.0).contains(&scan.start_angle)
-                || (..=25.0).contains(&scan.start_angle)
-                || (360.0 - 25.0..=360.0).contains(&scan.end_angle)
-                || (..=25.0).contains(&scan.end_angle)
-            {
-                defmt::trace!("Accepted scan");
-                *last = true;
-
-                // Add points to AEB. AEB cannot be running while this CS is running, but this is garrentied by priorities.
-                _cx.shared.aeb.lock(|aeb| {
-                    for (i, p) in scan.data.into_iter().enumerate() {
-                        // Filter out close or unlikely points
-                        if p.dist < 150 || p.confidence < 150 {
-                            continue;
-                        }
-
-                        // Convert LiDAR points into standard polar points
-                        let polar = scan.get_range_in_polar(i as u16);
-                        // Transform from polar to cartiesian
-                        let kart = KartPoint::from_polar(polar.0 / 1000.0, polar.1);
-
-                        aeb.add_points(&[kart])
-                    }
-                });
-            }
-            // Spawn AEB if we have had scans in the range, but we now left the range
-            else if *last {
-                *last = false;
-                defmt::trace!("Full scan received, spawning AEB");
-
-                /*_cx.shared.aeb.lock(|aeb| {
-                    defmt::debug!("{}", defmt::Display2Format(&aeb));
-                });*/
-
-                run_aeb::spawn().unwrap();
-            }
+            // Handle in different thread to avoid starving tasks
+            app::handle_lidar_scan::spawn(scan).unwrap();
         }
         Err(nb::Error::Other(err)) => match err {
             ParseError::SerialErr(err) => match err {
@@ -320,6 +291,49 @@ fn lidar_read(mut _cx: app::lidar_read::Context) {
             }
         },
         _ => {}
+    }
+}
+
+/// Handles a scan, spawning AEB if the map is full.
+fn handle_lidar_scan(mut _cx: app::handle_lidar_scan::Context, scan: PartialScan) {
+    let last = _cx.local.last_scan_in_bounds;
+
+    // Run AEB after we have multiple scans over our desired area
+    if (360.0 - 25.0..=360.0).contains(&scan.start_angle)
+        || (..=25.0).contains(&scan.start_angle)
+        || (360.0 - 25.0..=360.0).contains(&scan.end_angle)
+        || (..=25.0).contains(&scan.end_angle)
+    {
+        defmt::trace!("Accepted scan");
+        *last = true;
+
+        // Add points to AEB. This prevents AEB from starting, but this task spawns AEB, so this is fine.
+        _cx.shared.aeb.lock(|aeb| {
+            for (i, p) in scan.data.into_iter().enumerate() {
+                // Filter out close or unlikely points
+                if p.dist < 150 || p.confidence < 150 {
+                    continue;
+                }
+
+                // Convert LiDAR points into standard polar points
+                let polar = scan.get_range_in_polar(i as u16);
+                // Transform from polar to cartiesian
+                let kart = KartPoint::from_polar(polar.0 / 1000.0, polar.1);
+
+                aeb.add_points(&[kart])
+            }
+        });
+    }
+    // Spawn AEB if we have had scans in the range, but we now left the range
+    else if *last {
+        *last = false;
+        defmt::trace!("Full scan received, spawning AEB");
+
+        /*_cx.shared.aeb.lock(|aeb| {
+            defmt::debug!("{}", defmt::Display2Format(&aeb));
+        });*/
+
+        run_aeb::spawn().unwrap();
     }
 }
 

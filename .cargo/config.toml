@@ -22,4 +22,4 @@ rb = "run --bin"
 rrb = "run --release --bin"
 
 [env]
-DEFMT_LOG = "trace"
+DEFMT_LOG = "debug"
