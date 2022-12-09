@@ -18,7 +18,7 @@ use stm32f7xx_hal::serial::Error;
 type Can1 = bxcan::Can<hal::can::Can<hal::pac::CAN1>>;
 
 /// AEB resolution
-const AEB_SIZE: usize = 31;
+const AEB_SIZE: usize = 411;
 
 #[rtic::app(
 device = crate::hal::pac,
@@ -188,7 +188,7 @@ mod app {
     use super::lidar_read;
 
     extern "Rust" {
-        #[task(capacity = 3, shared = [aeb], priority = 3)]
+        #[task(capacity = 10, shared = [aeb], priority = 3)]
         fn run_aeb(_cx: run_aeb::Context);
 
         #[task(binds = CAN1_RX0, local = [can, led], shared = [aeb], priority = 1)]
@@ -198,7 +198,7 @@ mod app {
         #[task(binds = UART4, local = [lidar_pwm, lidar], priority = 4)]
         fn lidar_read(_cx: lidar_read::Context);
 
-        #[task(capacity = 32, shared = [aeb], local = [last_scan_in_bounds], priority = 2)]
+        #[task(capacity = 128, shared = [aeb], local = [last_scan_in_bounds], priority = 2)]
         fn handle_lidar_scan(_cx: handle_lidar_scan::Context, scan: PartialScan);
     }
 }
@@ -330,7 +330,7 @@ fn handle_lidar_scan(mut _cx: app::handle_lidar_scan::Context, scan: PartialScan
         defmt::trace!("Full scan received, spawning AEB");
 
         /*_cx.shared.aeb.lock(|aeb| {
-            defmt::debug!("{}", defmt::Display2Format(&aeb));
+            defmt::info!("{}", defmt::Display2Format(&aeb));
         });*/
 
         run_aeb::spawn().unwrap();
