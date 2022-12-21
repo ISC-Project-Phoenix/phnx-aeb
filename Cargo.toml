@@ -16,15 +16,14 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 systick-monotonic = "1.0.0"
 bxcan = "0.7.0"
 
-#TODO use github when done develuping
-aeb_rs = { path = "../aeb_rs" }
-ld06-embed = { path = "../LD06-embed" }
+aeb_rs = { git = "https://github.com/ISC-Project-Phoenix/aeb_rs.git" }
+ld06-embed = { git = "https://github.com/andyblarblar/LD06-embed.git" }
 phnx-candefs = { git = "https://github.com/ISC-Project-Phoenix/phnx-candefs.git" }
 
 [dependencies.stm32f7xx-hal]
 version = "0.7.0"
 features = ["stm32f767", "rt", "rtic", "has-can"]
-git = "https://github.com/andyblarblar/stm32f7xx-hal.git"
+git = "https://github.com/stm32-rs/stm32f7xx-hal.git"
 
 # cargo build/run
 [profile.dev]
